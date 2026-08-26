@@ -193,6 +193,79 @@ export namespace Track {
         };
     };
 
+    export type LocalServerPromptReceived = {
+        action: 'rovoDevLocalServerPromptReceived';
+        subject: 'atlascode';
+        attributes: {
+            rovoDevEnv: RovoDevEnv;
+            appInstanceId: string;
+            result: 'triggered' | 'agent_busy' | 'provider_not_ready' | 'error' | 'invalid_request';
+        };
+    };
+
+    /**
+     * Closed enum for `PromptCompleted.attributes.result`.
+     *
+     * Values outside this set will be dropped by the Boysenberry → Jira analytics
+     * bridge, so this MUST be kept aligned with the bridge spec. Add new values
+     * via a coordinated change on both sides.
+     */
+    export type PromptCompletedResult = 'success' | 'error' | 'cancelled' | 'timeout' | 'parse_error';
+
+    /**
+     * Closed enum for `PromptCompleted.attributes.errorReason`.
+     *
+     * Only present when `result !== 'success'`. Values outside this set will be
+     * dropped by the bridge. Add new values via a coordinated change.
+     */
+    export type PromptCompletedErrorReason =
+        | 'stream_exception' // event_kind: 'exception' arrived in the response stream
+        | 'parsing_error' // event_kind: '_parsing_error'
+        | 'network_error' // fetch / reader threw
+        | 'http_4xx' // local-server returned 4xx (excluding 401/403 which short-circuit to login)
+        | 'http_5xx' // local-server returned 5xx
+        | 'aborted' // user pressed stop, OR new prompt aborted in-flight
+        | 'no_response' // stream ended without any user-visible message parts
+        | 'unknown'; // catch-all when the cause cannot be classified
+
+    /**
+     * Emitted exactly once per user-submitted prompt as the terminal outcome of
+     * the chat-streaming flow. Used to drive the chat-response SLO downstream
+     * (success rate = count(result='success') / count(all results)).
+     *
+     * Invariants:
+     *   - Exactly-once per `promptId`.
+     *   - `result: 'success'` implies at least one user-visible message part was rendered.
+     *   - Never emitted for the `replay` streaming path.
+     */
+    export type PromptCompleted = {
+        action: 'rovoDevPromptCompleted';
+        subject: 'atlascode';
+        attributes: {
+            rovoDevEnv: RovoDevEnv;
+            appInstanceId: string;
+            sessionId: string;
+            promptId: string;
+            result: PromptCompletedResult;
+            /** Only present when `result !== 'success'`. */
+            errorReason?: PromptCompletedErrorReason;
+            /**
+             * Optional free-form name of the specific underlying error, present
+             * only when `result !== 'success'`. Unlike the closed `errorReason`
+             * bucket, this carries the concrete cause so backend failures can be
+             * diagnosed from the SLO without cross-referencing Sentry — e.g. the
+             * agent exception class (`response.type`) for `stream_exception`, or
+             * `error.name` for fetch/HTTP failures. High-cardinality: intended for
+             * grouping/inspection, not as a primary SLO dimension.
+             */
+            errorName?: string;
+            /** Optional: HTTP status when the error was an HTTP-layer failure. */
+            httpStatus?: number;
+            /** Optional: number of user-visible message parts processed in the stream. */
+            messagePartsCount?: number;
+        };
+    };
+
     // TODO: rovodev metadata fields here are different from other events, reconcile later?
     export type PerformanceEvent = {
         action: 'performanceEvent';
@@ -220,4 +293,6 @@ export type TrackEvent =
     | Track.AiResultViewed
     | Track.RestartProcessAction
     | Track.ReplayCompleted
-    | Track.PerformanceEvent;
+    | Track.PerformanceEvent
+    | Track.LocalServerPromptReceived
+    | Track.PromptCompleted;

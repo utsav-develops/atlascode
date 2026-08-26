@@ -1,10 +1,11 @@
 import { Logger } from 'src/logger';
+import { getProductName } from 'src/rovo-dev/api/rovodevStaticConfig';
 import { RovoDevViewResponse } from 'src/rovo-dev/ui/rovoDevViewMessages';
 import { v4 } from 'uuid';
 import { commands, Event, EventEmitter } from 'vscode';
 
 import { Container } from '../container';
-import { Features } from '../util/features';
+import { Track } from './analytics/events';
 import { ExtensionApi } from './api/extensionApi';
 import {
     AgentMode,
@@ -78,8 +79,28 @@ export class RovoDevChatProvider {
     private _webView: TypedWebview<RovoDevProviderMessage, RovoDevViewResponse> | undefined;
     private _onUnauthorizedCallback: (() => Promise<void>) | undefined;
 
+    /**
+     * Bounded LRU of `promptId`s for which `rovoDevPromptCompleted` has already
+     * been fired. Used to enforce the exactly-once-per-prompt invariant on the
+     * `rovoDevPromptCompleted` telemetry event without unbounded memory growth.
+     *
+     * Insertion-ordered (a `Set` preserves insertion order); when the cap is
+     * exceeded the oldest entry is evicted. The cap is set well above the
+     * realistic number of concurrent in-flight + recently-finished prompts.
+     */
+    private _completedPromptIds: Set<string> = new Set<string>();
+    private static readonly _completedPromptIdsCap = 64;
+    /** Counts user-visible message parts seen during the current prompt's stream. */
+    private _currentPromptUserVisiblePartsCount = 0;
+
     private _replayInProgress = false;
     private _lastMessageSentTime: number | undefined;
+
+    // true while a live-preview stream is being processed (drives non-retriable
+    // errors and restoring the button when the attempt doesn't start a preview)
+    private _livePreviewInProgress = false;
+    // set when a `configure_live_preview` tool-call is seen, i.e. the preview started
+    private _livePreviewStarted = false;
 
     private get isDebugPanelEnabled() {
         return this.extensionApi.config.isDebugPanelEnabled();
@@ -295,8 +316,13 @@ export class RovoDevChatProvider {
 
     public async executeReplay(): Promise<void> {
         if (!this._rovoDevApiClient) {
-            const error = new Error('Unable to replay the previous conversation. Rovo Dev failed to initialize');
-            RovoDevTelemetryProvider.logError(error, 'Cannot replay conversation - Rovo Dev not initialized');
+            const error = new Error(
+                `Unable to replay the previous conversation. ${getProductName()} failed to initialize`,
+            );
+            RovoDevTelemetryProvider.logError(
+                error,
+                `Cannot replay conversation - ${getProductName()} not initialized`,
+            );
             throw error;
         }
 
@@ -320,6 +346,12 @@ export class RovoDevChatProvider {
 
     public async executeCancel(fromNewSession: boolean): Promise<boolean> {
         const webview = this._webView!;
+
+        // Clear any pending deferred tool call so the next user prompt is sent
+        // as a plain message instead of a tool-call response.  Without this the
+        // backend would reject the prompt with "Cannot provide a new user prompt
+        // when the message history contains unprocessed tool calls".
+        this._pendingDeferredRequest = undefined;
 
         let success: boolean;
         if (this._rovoDevApiClient) {
@@ -372,6 +404,15 @@ export class RovoDevChatProvider {
                     failed: success ? undefined : true,
                 },
             });
+
+            // Fire the terminal `rovoDevPromptCompleted` for this prompt so the
+            // chat-response SLO sees a cancelled outcome. We only emit when the
+            // cancel actually succeeded; a failed cancel leaves the stream
+            // running, in which case the eventual stream-end path will classify
+            // the prompt instead.
+            if (success) {
+                this.firePromptCompleted('cancelled', { errorReason: 'aborted' });
+            }
         }
 
         return success;
@@ -379,6 +420,10 @@ export class RovoDevChatProvider {
 
     private beginNewPrompt(overrideId?: string): void {
         this._currentPromptId = overrideId || v4();
+        // Reset the per-prompt user-visible message-part counter so that the
+        // `no_response` vs `success` classification at the end of the stream
+        // reflects only this prompt.
+        this._currentPromptUserVisiblePartsCount = 0;
         this._telemetryProvider.startNewPrompt(this._currentPromptId);
     }
 
@@ -387,8 +432,8 @@ export class RovoDevChatProvider {
 
         const response = await fetchOp;
         if (!response.body) {
-            const error = new Error("Error processing the Rovo Dev's response: response is empty.");
-            RovoDevTelemetryProvider.logError(error, 'Received empty response from Rovo Dev');
+            const error = new Error(`Error processing the ${getProductName()}'s response: response is empty.`);
+            RovoDevTelemetryProvider.logError(error, `Received empty response from ${getProductName()}`);
             throw error;
         }
 
@@ -456,6 +501,14 @@ export class RovoDevChatProvider {
                     isFirstMessage = false;
                 }
 
+                // Count user-visible parts so the terminal classification can
+                // distinguish a successful response from a stream that ended
+                // without delivering anything (`no_response`). Only the chat
+                // path participates in the SLO.
+                if (sourceApi === 'chat' && this.isUserVisiblePart(msg)) {
+                    this._currentPromptUserVisiblePartsCount++;
+                }
+
                 await this.processRovoDevResponse(sourceApi, msg);
             }
         }
@@ -467,6 +520,9 @@ export class RovoDevChatProvider {
         this._lastMessageSentTime = performance.now();
 
         for (const msg of parser.flush()) {
+            if (sourceApi === 'chat' && this.isUserVisiblePart(msg)) {
+                this._currentPromptUserVisiblePartsCount++;
+            }
             await this.processRovoDevResponse(sourceApi, msg);
         }
 
@@ -474,6 +530,52 @@ export class RovoDevChatProvider {
         // While we should handle such events in real time, this is meant to capture anything that we
         // may have missed, and make sure the agent selector is always in sync with Rovo Dev
         this._onAgentModelChanged.fire();
+
+        // Terminal classification for the SLO:
+        //   - `success` ⇒ at least one user-visible part was rendered.
+        //   - `no_response` ⇒ stream ended cleanly but no part was rendered
+        //     (e.g. backend returned an empty stream).
+        // The dedupe Set ensures this is a no-op if a mid-stream error already
+        // classified the prompt (e.g. `_parsing_error`, `exception`).
+        if (sourceApi === 'chat') {
+            const partsCount = this._currentPromptUserVisiblePartsCount;
+            if (partsCount > 0) {
+                this.firePromptCompleted('success', { messagePartsCount: partsCount });
+            } else {
+                // Sub-classify `no_response` via `errorName` so the SLO can tell
+                // genuinely-empty backend streams apart from turns that only
+                // produced control/lifecycle events (thinking, warning,
+                // deferred permission request, …) and therefore legitimately
+                // rendered no user-visible part:
+                //   - `no_response_empty_stream`  ⇒ not a single message was
+                //     parsed from the stream (isFirstMessage never flipped).
+                //   - `no_response_control_only`  ⇒ messages arrived but none
+                //     were user-visible (often a benign, expected outcome).
+                const errorName = isFirstMessage ? 'no_response_empty_stream' : 'no_response_control_only';
+                this.firePromptCompleted('error', {
+                    errorReason: 'no_response',
+                    errorName,
+                    messagePartsCount: 0,
+                });
+            }
+        }
+    }
+
+    /**
+     * Whether a streamed `RovoDevResponse` represents a "user-visible" message
+     * part for the purposes of the chat-response SLO. Text and tool activity
+     * count as user-visible output; control / lifecycle events (warnings,
+     * prune notices, replay markers, dialog signals, …) do not.
+     */
+    private isUserVisiblePart(response: RovoDevResponse): boolean {
+        switch (response.event_kind) {
+            case 'text':
+            case 'tool-call':
+            case 'tool-return':
+                return true;
+            default:
+                return false;
+        }
     }
 
     private async processRovoDevReplayResponse(responses: RovoDevResponse[]): Promise<void> {
@@ -518,7 +620,11 @@ export class RovoDevChatProvider {
             this._pendingDeferredRequest = deferredTool.tool_call_id;
             switch (deferredTool.tool_name) {
                 case 'ask_user_questions':
-                    const askUserQuestionsArgs = JSON.parse(deferredTool.args) as RovoDevAskUserQuestionsToolArgs;
+                    const askUserQuestionsArgs = (
+                        deferredTool.args && typeof deferredTool.args === 'string'
+                            ? JSON.parse(deferredTool.args)
+                            : deferredTool.args
+                    ) as RovoDevAskUserQuestionsToolArgs;
                     await webview.postMessage({
                         type: RovoDevProviderMessageType.ShowDeferredAskUserQuestions,
                         toolCallId: deferredTool.tool_call_id,
@@ -526,7 +632,9 @@ export class RovoDevChatProvider {
                     });
                     break;
                 case 'exit_plan_mode':
-                    const exitPlanModeArgs = JSON.parse(deferredTool.args) as RovoDevExitPlanModeToolArgs;
+                    const exitPlanModeArgs = (
+                        typeof deferredTool.args === 'string' ? JSON.parse(deferredTool.args) : deferredTool.args
+                    ) as RovoDevExitPlanModeToolArgs;
                     await webview.postMessage({
                         type: RovoDevProviderMessageType.ShowDeferredExitPlanMode,
                         toolCallId: deferredTool.tool_call_id,
@@ -559,24 +667,34 @@ export class RovoDevChatProvider {
                 });
                 break;
 
-            case 'tool-call':
+            case 'tool-call': {
                 await webview.postMessage({
                     type: RovoDevProviderMessageType.RovoDevResponseMessage,
                     message: response,
                 });
-
-                if (response.tool_name === 'configure_live_preview') {
+                if (response.tool_name === 'configure_live_preview' && sourceApi !== 'replay') {
+                    this._livePreviewStarted = true;
+                    webview
+                        .postMessage({
+                            type: RovoDevProviderMessageType.ShowLivePreviewButton,
+                            show: false,
+                        })
+                        .then(null, (ex) => {
+                            Logger.error(ex, 'Error while sending hide live preview button message');
+                        });
                     try {
-                        const args = JSON.parse(response.args);
+                        const args = typeof response.args === 'string' ? JSON.parse(response.args) : response.args;
                         if (args.port) {
-                            await commands.executeCommand('workbench.action.launchLivePreview', args.port);
+                            await commands.executeCommand('workbench.action.launchLivePreview', args.port, {
+                                showPreview: true,
+                            });
                         }
                     } catch (e) {
-                        Logger.debug('Failed to parse configure_live_preview args:', e);
+                        Logger.error(e, 'Failed to parse configure_live_preview args');
                     }
                 }
                 break;
-
+            }
             case 'tool-return':
                 await webview.postMessage({
                     type: RovoDevProviderMessageType.RovoDevResponseMessage,
@@ -608,6 +726,15 @@ export class RovoDevChatProvider {
                 break;
 
             case '_parsing_error':
+                // Terminal classification for this prompt. The dedupe Set in
+                // firePromptCompleted ensures the later `success` emit from
+                // processResponse's normal exit path becomes a no-op.
+                if (sourceApi !== 'replay') {
+                    this.firePromptCompleted('parse_error', {
+                        errorReason: 'parsing_error',
+                        errorName: response.error?.name || undefined,
+                    });
+                }
                 await this.processError(response.error, { showOnlyInDebug: true });
                 break;
 
@@ -636,7 +763,21 @@ export class RovoDevChatProvider {
                 RovoDevTelemetryProvider.logError(
                     new Error(`${response.type} ${response.message}`),
                     response.title || undefined,
+                    ...(response.params || []),
                 );
+
+                // Terminal classification: an `exception` event_kind from the
+                // stream means the agent surfaced a hard error mid-response.
+                // Replay path never fires PromptCompleted.
+                if (sourceApi !== 'replay') {
+                    this.firePromptCompleted('error', {
+                        errorReason: 'stream_exception',
+                        // `response.type` is the concrete agent error class (e.g.
+                        // `UserError`, `RuntimeError`), letting the SLO break down
+                        // stream_exception by real cause.
+                        errorName: response.type || undefined,
+                    });
+                }
 
                 const { text, link } = this.parseExceptionMessage(response.message);
                 await webview.postMessage({
@@ -760,8 +901,10 @@ export class RovoDevChatProvider {
                         type: RovoDevProviderMessageType.ShowDialog,
                         message: {
                             type: 'warning',
-                            title: "You've reached your Rovo Dev credit limit",
-                            text: alert_message.message.replace('{ctaLink}', ''),
+                            title: `You've reached your ${getProductName()} credit limit`,
+                            text: alert_message.message
+                                .replace('{title}', response.data.content.title)
+                                .replace('{ctaLink}', ''),
                             event_kind: '_RovoDevDialog',
                             ctaLink: alert_message.ctaLink,
                         },
@@ -804,12 +947,25 @@ export class RovoDevChatProvider {
 
             case 'ui_changes_detected':
                 // Only show live preview button in Boysenberry
-                if (!Container.isBoysenberryMode || !Container.featureFlagClient.checkGate(Features.BbyLivePreview)) {
+                if (!Container.isBoysenberryMode) {
+                    return;
+                }
+                // Check feature flag enabled for live preview
+                let isLivePreviewFeatureEnabled = false;
+                if ('SANDBOX_ENABLE_LIVE_PREVIEW' in process.env && process.env.SANDBOX_ENABLE_LIVE_PREVIEW) {
+                    try {
+                        isLivePreviewFeatureEnabled = Boolean(JSON.parse(process.env.SANDBOX_ENABLE_LIVE_PREVIEW));
+                    } catch {
+                        // ignore parsing error and treat it as the feature being disabled
+                    }
+                }
+                if (!isLivePreviewFeatureEnabled) {
                     return;
                 }
 
                 await webview.postMessage({
                     type: RovoDevProviderMessageType.ShowLivePreviewButton,
+                    show: true,
                 });
                 break;
 
@@ -829,8 +985,9 @@ export class RovoDevChatProvider {
             default:
                 // this should really never happen, as unknown messages are caugh and wrapped into the
                 // message `_parsing_error`
-                // @ts-expect-error ts(2339) - response here should be 'never'
-                const error = new Error(`Rovo Dev response error: unknown event kind: ${response.event_kind}`);
+                const error = new Error(
+                    `${getProductName()} response error: unknown event kind: ${(response as any).event_kind}`,
+                );
                 RovoDevTelemetryProvider.logError(error);
                 throw error;
         }
@@ -930,7 +1087,14 @@ export class RovoDevChatProvider {
             try {
                 await func(this._rovoDevApiClient);
             } catch (error) {
-                if (error.name === 'AbortError') {
+                if (error.name === 'AbortError' || (error instanceof TypeError && error.message === 'terminated')) {
+                    // Unexpected mid-stream abort that did not go through
+                    // executeCancel (which would have already emitted
+                    // 'cancelled'). The dedupe Set keeps this a no-op when the
+                    // user-initiated cancel already classified the prompt.
+                    if (sourceApi === 'chat') {
+                        this.firePromptCompleted('cancelled', { errorReason: 'aborted' });
+                    }
                     await webview.postMessage({
                         type: RovoDevProviderMessageType.CompleteMessage,
                         promptId: this._currentPromptId,
@@ -946,14 +1110,35 @@ export class RovoDevChatProvider {
                 if (isUnauthorizedError) {
                     Logger.info('Detected unauthorized error - triggering login UI');
                     if (this._onUnauthorizedCallback) {
+                        // Intentionally do NOT emit rovoDevPromptCompleted here:
+                        // the user will re-authenticate and the next prompt
+                        // (or retry) provides a clean SLO sample.
                         await this._onUnauthorizedCallback();
                         return;
                     }
                 }
-                // the error is retriable only when it happens during the streaming of a 'chat' response
-                await this.processError(error, { isRetriable: sourceApi === 'chat' });
+                // Terminal classification for fetch / HTTP / reader errors.
+                // Replay path is excluded — the SLO only covers user-submitted
+                // prompts. The dedupe Set ensures that if an in-stream event
+                // (e.g. `_parsing_error` or `exception`) already classified
+                // this prompt, this call becomes a no-op.
+                if (sourceApi === 'chat') {
+                    const { errorReason, errorName, httpStatus } = this.classifyStreamingError(error);
+                    this.firePromptCompleted('error', {
+                        errorReason,
+                        ...(errorName !== undefined ? { errorName } : {}),
+                        ...(httpStatus !== undefined ? { httpStatus } : {}),
+                    });
+                }
+                // retriable only for a 'chat' response; live-preview retries via the restored button
+                await this.processError(error, {
+                    isRetriable: sourceApi === 'chat' && !this._livePreviewInProgress,
+                });
             }
         } else {
+            if (sourceApi === 'chat') {
+                this.firePromptCompleted('error', { errorReason: 'unknown' });
+            }
             await this.processError(new Error('RovoDev client not initialized'));
         }
 
@@ -966,6 +1151,90 @@ export class RovoDevChatProvider {
 
         // Signal that the prompt is complete so listeners can refresh data
         this._onPromptComplete.fire();
+    }
+
+    /**
+     * Classify a thrown error from the streaming-API catch block into a
+     * `PromptCompletedErrorReason` and (when applicable) an HTTP status code.
+     * Kept in one place so the chat-response SLO classification stays in sync
+     * with the user-facing error dialog logic in `processError`.
+     */
+    private classifyStreamingError(error: unknown): {
+        errorReason: Track.PromptCompletedErrorReason;
+        errorName?: string;
+        httpStatus?: number;
+    } {
+        // Concrete error name for diagnosis (e.g. `TypeError`, `RovoDevApiError`,
+        // `FetchError`). High-cardinality companion to the closed `errorReason`.
+        const errorName = error instanceof Error ? error.name : undefined;
+        if (error instanceof RovoDevApiError && typeof error.httpStatus === 'number') {
+            const status = error.httpStatus;
+            if (status >= 500 && status < 600) {
+                return { errorReason: 'http_5xx', errorName, httpStatus: status };
+            }
+            if (status >= 400 && status < 500) {
+                return { errorReason: 'http_4xx', errorName, httpStatus: status };
+            }
+        }
+        return { errorReason: 'network_error', errorName };
+    }
+
+    /**
+     * Emit the terminal `rovoDevPromptCompleted` event for the current prompt.
+     *
+     * Enforces the exactly-once-per-prompt invariant via `_completedPromptIds`,
+     * so it is safe to call from multiple terminal paths (in-stream exception,
+     * parse error, fetch error catch block, normal stream end, user cancel) for
+     * the same prompt — the first call wins.
+     *
+     * Only emits when running in Boysenberry mode — this event exists solely to
+     * drive the chat-response SLO computed on the host Jira page via the
+     * VSCode → Jira analytics bridge. In the standard IDE there is no consumer
+     * for the event and emitting it would just add noise to the analytics
+     * pipeline.
+     *
+     * Never emits for the replay streaming path (the caller should not invoke
+     * this with `sourceApi === 'replay'`).
+     */
+    private firePromptCompleted(
+        result: Track.PromptCompletedResult,
+        extras: {
+            errorReason?: Track.PromptCompletedErrorReason;
+            errorName?: string;
+            httpStatus?: number;
+            messagePartsCount?: number;
+        } = {},
+    ): void {
+        if (!this._isBoysenberry) {
+            return;
+        }
+
+        const promptId = this._currentPromptId;
+        if (!promptId || this._completedPromptIds.has(promptId)) {
+            return; // exactly-once dedupe
+        }
+
+        // Bounded LRU: evict oldest entry when at cap. `Set` preserves insertion order.
+        if (this._completedPromptIds.size >= RovoDevChatProvider._completedPromptIdsCap) {
+            const oldest = this._completedPromptIds.values().next().value;
+            if (oldest !== undefined) {
+                this._completedPromptIds.delete(oldest);
+            }
+        }
+        this._completedPromptIds.add(promptId);
+
+        this._telemetryProvider.fireTelemetryEvent({
+            action: 'rovoDevPromptCompleted',
+            subject: 'atlascode',
+            attributes: {
+                promptId,
+                result,
+                ...(extras.errorReason !== undefined ? { errorReason: extras.errorReason } : {}),
+                ...(extras.errorName !== undefined ? { errorName: extras.errorName } : {}),
+                ...(extras.httpStatus !== undefined ? { httpStatus: extras.httpStatus } : {}),
+                ...(extras.messagePartsCount !== undefined ? { messagePartsCount: extras.messagePartsCount } : {}),
+            },
+        });
     }
 
     private async processError(
@@ -1004,6 +1273,71 @@ export class RovoDevChatProvider {
             text,
             context,
         });
+    }
+
+    /**
+     * Triggers a live-preview request on the agent, then streams the agent's response into the
+     * chat exactly like a normal user-initiated chat would. Used by the Live Preview button —
+     * clicking that button causes the agent to behave as if the user had asked it to start a
+     * live preview, so we:
+     *   1. Begin a fresh prompt (new promptId + telemetry bucket).
+     *   2. Tell the webview to enter "GeneratingResponse" mode without echoing a user-message
+     *      bubble (echoMessage = false).
+     *   3. POST `/v3/live-preview` and pipe its SSE body through the same `processResponse`
+     *      pipeline used for `executeChat`, so text parts, tool-calls, and tool-returns all
+     *      render in the chat as they stream in.
+     */
+    public async executeLivePreview(): Promise<void> {
+        if (!this._rovoDevApiClient) {
+            const error = new Error(`Unable to start live preview. ${getProductName()} failed to initialize`);
+            RovoDevTelemetryProvider.logError(error, `Cannot start live preview - ${getProductName()} not initialized`);
+            throw error;
+        }
+        if (!this._webView) {
+            return;
+        }
+
+        // Backstop against the HTTP 409 "agent busy" race: `/v3/live-preview` starts a
+        // `stream_chat`, which the backend rejects if one is already in flight.
+        if (this.isAgentRunning) {
+            Logger.info('Ignoring live preview request: the agent is already running');
+            // Restore the button (hidden optimistically on click) without touching the
+            // running response's state, so it reappears once the response finishes.
+            await this._webView.postMessage({
+                type: RovoDevProviderMessageType.ShowLivePreviewButton,
+                show: true,
+            });
+            return;
+        }
+
+        this._livePreviewInProgress = true;
+        this._livePreviewStarted = false;
+
+        this.beginNewPrompt();
+        await this.signalPromptSent({ text: 'Start a live preview for this project', context: [] }, true);
+
+        const fetchOp = async (client: RovoDevApiClient) => {
+            this._abortController = new AbortController();
+
+            const response = client.createLivePreview(this._abortController.signal);
+            return this.processResponse('chat', response);
+        };
+
+        try {
+            await this.executeStreamingApiWithErrorHandling('chat', fetchOp);
+        } finally {
+            this._abortController = null;
+
+            // if the preview never started, restore the button so the user can retry
+            if (!this._livePreviewStarted && this._webView) {
+                await this._webView.postMessage({
+                    type: RovoDevProviderMessageType.ShowLivePreviewButton,
+                    show: true,
+                });
+            }
+
+            this._livePreviewInProgress = false;
+        }
     }
 
     private preparePayloadForChatRequest(prompt: RovoDevPrompt): RovoDevChatRequest {

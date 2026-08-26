@@ -47,7 +47,7 @@
     ],
     "main": "./build/extension/extension",
     "rovoDev": {
-        "version": "202604.11.1"
+        "version": "202608.26.1b1"
     },
     "scripts": {
         "vscode:uninstall": "node ./build/extension/uninstall.js",
@@ -583,11 +583,6 @@
                 "category": "Atlassian"
             },
             {
-                "command": "atlascode.rovodev.openHelp",
-                "title": "Documentation",
-                "category": "Atlassian"
-            },
-            {
                 "command": "atlascode.rovodev.enable",
                 "title": "Enable Rovo Dev",
                 "category": "Rovo Dev"
@@ -771,11 +766,6 @@
                     "command": "atlascode.rovodev.shareFeedback",
                     "when": "view == atlascode.views.rovoDev.webView",
                     "group": "rovoDevContextMenu2@1"
-                },
-                {
-                    "command": "atlascode.rovodev.openHelp",
-                    "when": "view == atlascode.views.rovoDev.webView",
-                    "group": "rovoDevContextMenu2@2"
                 },
                 {
                     "command": "atlascode.rovodev.restartProcess",
@@ -1762,6 +1752,7 @@
         "clsx": "^2.1.1",
         "date-fns": "^4.1.0",
         "diff": "^8.0.3",
+        "dompurify": "^3.4.8",
         "eventemitter3": "^5.0.1",
         "express": "^5.1.0",
         "fast-deep-equal": "^3.1.1",
@@ -1817,7 +1808,7 @@
         "tunnel": "^0.0.6",
         "turndown": "^7.2.2",
         "use-constant": "^2.0.0",
-        "uuid": "^11.1.0",
+        "uuid": "^14.0.0",
         "vscode-languageclient": "^9.0.1",
         "websocket": "^1.0.35"
     },
@@ -1845,7 +1836,6 @@
         "@types/semver": "^7.1.0",
         "@types/tunnel": "^0.0.7",
         "@types/turndown": "^5.0.1",
-        "@types/uuid": "^10.0.0",
         "@types/vscode": ">=1.77.0 <=1.96.0",
         "@types/websocket": "^1.0.0",
         "@types/ws": "^8.18.1",
@@ -1853,7 +1843,7 @@
         "ajv": "^8.17.1",
         "ajv-formats": "^3.0.1",
         "autoprefixer": "^10.4.20",
-        "concurrently": "^9.1.2",
+        "concurrently": "^10.0.3",
         "css-loader": "^7.1.2",
         "dotenv": "^17.2.3",
         "eslint": "^9.27.0",

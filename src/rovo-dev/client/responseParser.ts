@@ -1,5 +1,6 @@
 // interfaces for the raw responses from the rovo dev agent
 
+import { isOsError, parseOsErrorMessage } from './osErrorParser';
 import {
     RovoDevClearResponse,
     RovoDevDeferredRequestResponse,
@@ -49,7 +50,8 @@ interface RovoDevTextChunk {
 // https://ai.pydantic.dev/api/messages/#pydantic_ai.messages.ToolCallPart
 interface RovoDevToolCallResponseRaw {
     tool_name: RovoDevToolName;
-    args?: string;
+    // The server may send `args` as a JSON string or as a pre-parsed object
+    args?: string | object;
     args_delta?: string;
     /** sets when the tool is being exposed by an MCP server */
     mcp_server?: string;
@@ -277,10 +279,15 @@ function parseResponseToolCall(
         buffer.args += data.args_delta || '';
         return buffer;
     } else {
+        // The server may send `args` as a pre-parsed object rather than a JSON string.
+        // Normalize to a string here so downstream JSON.parse() calls don't receive an object,
+        // which would be coerced to "[object Object]" and throw a SyntaxError.
+        const rawArgs = data.args ?? '';
+        const args = typeof rawArgs === 'string' ? rawArgs : JSON.stringify(rawArgs);
         return {
             event_kind: 'tool-call',
             tool_name: data.tool_name,
-            args: data.args || '',
+            args,
             mcp_server: data.mcp_server,
             tool_call_id: data.tool_call_id,
         };
@@ -321,6 +328,16 @@ function parseResponseRetryPrompt(
 }
 
 function parseResponseException(data: RovoDevExceptionResponseRaw): RovoDevExceptionResponse {
+    try {
+        if (isOsError(data.type, data.message)) {
+            const parsedOsError = parseOsErrorMessage(data.type, data.message, data.title);
+            if (parsedOsError) {
+                return parsedOsError;
+            }
+        }
+    } catch {
+        // Fall through to the unparsed exception response below.
+    }
     return {
         event_kind: 'exception',
         message: data.message,
@@ -368,10 +385,96 @@ function parseDeferredRequest(data: RovoDevDeferredRequestResponseRaw): RovoDevD
 }
 // the parser
 
+/**
+ * The SSE chunk did not match the expected `event: <kind>\ndata: <payload>`
+ * shape. Named distinctly so the `rovoDevPromptCompleted` SLO can break
+ * `parsing_error` down by concrete cause via the `errorName` attribute.
+ */
+export class RovoDevChunkShapeError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'RovoDevChunkShapeError';
+    }
+}
+
+/**
+ * The `data:` payload of an SSE chunk was not valid JSON.
+ */
+export class RovoDevJsonParseError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'RovoDevJsonParseError';
+    }
+}
+
+/**
+ * The stream ended while a partial chunk was still buffered (truncated stream).
+ */
+export class RovoDevIncompleteStreamError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'RovoDevIncompleteStreamError';
+    }
+}
+
 function generateError(error: Error): RovoDevParsingError {
     return {
         event_kind: '_parsing_error',
         error,
+    };
+}
+
+interface ParsedSseChunk {
+    /** The `event:` field value, or `undefined` when the chunk is malformed. */
+    eventKind?: string;
+    /** The concatenated `data:` field payload. */
+    data: string;
+    /** Whether the entire chunk is an SSE comment (keep-alive / ping). */
+    isComment: boolean;
+}
+
+/**
+ * Parse a single SSE chunk (already split on the blank-line boundary) following
+ * the SSE line grammar. Supports multi-line `data:` payloads by concatenating
+ * successive `data:` lines with `\n`, so JSON payloads that legitimately contain
+ * newlines are preserved rather than misparsed.
+ *
+ * Returns `isComment: true` for chunks whose lines are all comments (lines
+ * starting with `:`), which covers keep-alive pings. Returns
+ * `eventKind: undefined` when no `event:` field is present (malformed chunk).
+ */
+function parseSseChunk(chunkRaw: string): ParsedSseChunk {
+    const lines = chunkRaw.split(/\r?\n/);
+
+    let eventKind: string | undefined;
+    const dataLines: string[] = [];
+    let sawNonComment = false;
+
+    for (const line of lines) {
+        if (line === '') {
+            continue;
+        }
+        // Comment line per the SSE spec (e.g. ": ping - 1641024000").
+        if (line.startsWith(':')) {
+            continue;
+        }
+        sawNonComment = true;
+
+        if (line.startsWith('event:')) {
+            eventKind = line.slice('event:'.length).trim();
+        } else if (line.startsWith('data:')) {
+            // Preserve the payload verbatim, only trimming a single optional
+            // leading space after the colon (per the SSE spec).
+            const value = line.slice('data:'.length);
+            dataLines.push(value.startsWith(' ') ? value.slice(1) : value);
+        }
+        // Unknown fields (e.g. `id:`, `retry:`) are ignored, matching SSE.
+    }
+
+    return {
+        eventKind,
+        data: dataLines.join('\n'),
+        isComment: !sawNonComment,
     };
 }
 
@@ -403,31 +506,44 @@ export class RovoDevResponseParser {
         this.buffer = responseChunks.pop() || '';
 
         for (const chunkRaw of responseChunks) {
-            // it seems sometimes RovoDev sends a ping back - we just ignore it
-            if (chunkRaw.startsWith(': ping - ')) {
+            // Parse the chunk following the SSE line grammar. A chunk is a set
+            // of lines; `event:` names the type and `data:` carries the payload.
+            // Per the SSE spec a `data:` payload can span multiple lines (each
+            // prefixed with `data:`), which are re-joined with `\n`. Handling
+            // this explicitly — instead of a single-line regex — prevents
+            // well-formed responses whose JSON payload contains newlines (e.g.
+            // multi-line tool output, code blocks, stack traces) from being
+            // misclassified as `_parsing_error` and inflating the SLO.
+            const { eventKind, data, isComment } = parseSseChunk(chunkRaw);
+
+            // Comment lines (starting with `:`) are keep-alives / pings — ignore.
+            if (isComment) {
                 continue;
             }
 
-            const match = chunkRaw.match(/^event: ([^\r\n]+)\r?\ndata: (.*)$/);
-            if (!match) {
-                yield generateError(new Error(`Rovo Dev parser error: unable to parse chunk: "${chunkRaw}"`));
+            if (eventKind === undefined) {
+                yield generateError(
+                    new RovoDevChunkShapeError(`Rovo Dev parser error: unable to parse chunk: "${chunkRaw}"`),
+                );
                 continue;
             }
 
             let parsedData: any = '';
-            if (match[2]) {
+            if (data) {
                 try {
-                    parsedData = typeof match[2] === 'string' ? JSON.parse(match[2]) : match[2];
+                    parsedData = JSON.parse(data);
                 } catch (e) {
                     yield generateError(
-                        new Error(`Rovo Dev parser error: unable to parse JSON data: "${match[2]}", error: ${e}`),
+                        new RovoDevJsonParseError(
+                            `Rovo Dev parser error: unable to parse JSON data: "${data}", error: ${e}`,
+                        ),
                     );
                     continue;
                 }
             }
 
             const chunk: RovoDevSingleChunk | RovoDevPartStartChunk | RovoDevPartDeltaChunk = {
-                event_kind: match[1].trim() as any,
+                event_kind: eventKind as any,
                 data: parsedData,
             };
 
@@ -503,7 +619,9 @@ export class RovoDevResponseParser {
     *flush() {
         // if there is still data in the buffer, something went wrong.
         if (this.buffer) {
-            yield generateError(new Error('Rovo Dev parser error: flushed with non-empty buffer'));
+            yield generateError(
+                new RovoDevIncompleteStreamError('Rovo Dev parser error: flushed with non-empty buffer'),
+            );
         }
 
         const chunk = this.flushPreviousChunk();

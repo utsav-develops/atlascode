@@ -91,10 +91,6 @@ export class Container {
     private static _rovodevDisposable?: vscode.Disposable = undefined;
 
     static async initialize(context: ExtensionContext, version: string) {
-        canFetchInternalUrl().then((success) => {
-            this._isInAtlassianNetwork = success;
-        });
-
         const analyticsEnv: string = this.isDebugging ? 'staging' : 'prod';
 
         this._analyticsClient = analyticsClient({
@@ -276,6 +272,7 @@ export class Container {
             machineId: this.machineId,
             appInstanceId: this.appInstanceId,
             sandboxSessionId: this.isBoysenberryMode ? process.env.SANDBOX_SESSION_ID : undefined,
+            veryLargeRepo: RovodevStaticConfig.isSandboxVeryLargeRepo,
         };
         await SentryService.getInstance().initialize(sentryConfig, (error: string) => {
             this.analyticsApi.fireSentryCapturedExceptionFailedEvent({ error });
@@ -543,11 +540,6 @@ export class Container {
         return this._featureFlagClient;
     }
 
-    private static _isInAtlassianNetwork: boolean | undefined;
-    public static get isInAtlassianNetwork() {
-        return this._isInAtlassianNetwork;
-    }
-
     private static _isRovoDevEnabled: boolean;
     public static get isRovoDevEnabled() {
         return this._isRovoDevEnabled;
@@ -700,19 +692,5 @@ export class Container {
     private static _createWorkItemWebviewProvider: CreateWorkItemWebviewProvider;
     public static get createWorkItemWebviewProvider() {
         return this._createWorkItemWebviewProvider;
-    }
-}
-
-async function canFetchInternalUrl(): Promise<boolean> {
-    try {
-        const result = await fetch('http://github.internal.atlassian.com/', {
-            method: 'GET',
-            signal: AbortSignal.timeout(5000),
-        });
-
-        const statusKind = Math.floor((result.status || 0) / 100);
-        return statusKind === 2 || statusKind === 3;
-    } catch {
-        return false;
     }
 }

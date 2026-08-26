@@ -12,7 +12,7 @@ import { RovoDevContextItem, State, ToolPermissionDialogChoice } from 'src/rovo-
 import { v4 } from 'uuid';
 
 import { DetailedSiteInfo, MinimalIssue } from '../api/extensionApiTypes';
-import { RovodevStaticConfig } from '../api/rovodevStaticConfig';
+import { getProductName, RovodevStaticConfig } from '../api/rovodevStaticConfig';
 import {
     RovoDevAgentModel,
     RovoDevProviderMessage,
@@ -45,7 +45,7 @@ import {
     ToolReturnParseResult,
 } from './utils';
 
-const DEFAULT_LOADING_MESSAGE: string = 'Rovo dev is working';
+const getDefaultLoadingMessage = (): string => `${getProductName()} is working`;
 
 const RovoDevView: React.FC = () => {
     const [currentState, setCurrentState] = useState<State>({ state: 'WaitingForPrompt' });
@@ -248,7 +248,8 @@ const RovoDevView: React.FC = () => {
         (event: RovoDevProviderMessage): void => {
             switch (event.type) {
                 case RovoDevProviderMessageType.SignalPromptSent:
-                    setPendingToolCallMessage(DEFAULT_LOADING_MESSAGE);
+                    setCurrentState({ state: 'GeneratingResponse' });
+                    setPendingToolCallMessage(getDefaultLoadingMessage());
                     if (event.echoMessage) {
                         handleAppendResponse({
                             event_kind: '_RovoDevUserPrompt',
@@ -281,7 +282,7 @@ const RovoDevView: React.FC = () => {
                             setPendingSubagentTasks([]);
                         }
                     } else if (last?.event_kind === 'tool-return') {
-                        setPendingToolCallMessage(DEFAULT_LOADING_MESSAGE); // Clear pending tool call
+                        setPendingToolCallMessage(getDefaultLoadingMessage()); // Clear pending tool call
                         setPendingSubagentTasks([]);
                     }
 
@@ -514,7 +515,7 @@ const RovoDevView: React.FC = () => {
                     break;
 
                 case RovoDevProviderMessageType.ShowLivePreviewButton:
-                    setShowLivePreviewButton(true);
+                    setShowLivePreviewButton(event.show);
                     break;
 
                 default:
@@ -673,6 +674,25 @@ const RovoDevView: React.FC = () => {
             type: RovoDevViewResponseType.RetryPromptAfterError,
         });
     }, [postMessage]);
+
+    // returns true if the live preview was started, false if it was skipped
+    // (agent no longer idle) so the caller can reset its own state
+    const onCreateLivePreview = useCallback((): boolean => {
+        // only start when idle, and hide the button immediately to avoid a
+        // double-click race that triggers an HTTP 409 ("agent busy")
+        if (currentState.state !== 'WaitingForPrompt') {
+            return false;
+        }
+
+        setShowLivePreviewButton(false);
+        setCurrentState({ state: 'GeneratingResponse' });
+
+        postMessage({
+            type: RovoDevViewResponseType.CreateLivePreview,
+        });
+
+        return true;
+    }, [currentState.state, postMessage]);
 
     const cancelResponse = useCallback((): void => {
         if (currentState.state === 'CancellingResponse') {
@@ -1030,7 +1050,7 @@ const RovoDevView: React.FC = () => {
 
     return (
         <RovoDevErrorContext.Provider value={{ reportError }}>
-            <RovoDevErrorBoundary postMessage={postMessage}>
+            <RovoDevErrorBoundary postMessage={postMessage} isAtlassianUser={isAtlassianUser}>
                 <div
                     id="rovoDevDragDropOverlay"
                     onDragLeave={(event) => {
@@ -1102,9 +1122,11 @@ const RovoDevView: React.FC = () => {
                         onJiraItemClick={onJiraItemClick}
                         onToolPermissionChoice={onToolPermissionChoice}
                         onLinkClick={onLinkClick}
+                        isAtlassianUser={isAtlassianUser}
                         credentialHints={credentialHints}
                         onGeneratePlanClick={(e: string, proceed: boolean) => handleExitPlanMode(proceed, e)}
                         showLivePreviewButton={showLivePreviewButton}
+                        onCreateLivePreview={onCreateLivePreview}
                     />
                     {!hidePromptBox && (
                         <div className="input-section-container">

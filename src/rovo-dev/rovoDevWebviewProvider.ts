@@ -29,6 +29,7 @@ import { Commands } from '../constants';
 import { GitErrorCodes } from '../typings/git';
 import { RovodevCommandContext, RovodevCommands } from './api/componentApi';
 import { DetailedSiteInfo, ExtensionApi, MinimalIssue } from './api/extensionApi';
+import { getProductName, RovodevStaticConfig } from './api/rovodevStaticConfig';
 import {
     AgentMode,
     RovoDevApiClient,
@@ -192,14 +193,6 @@ export class RovoDevWebviewProvider extends Disposable implements WebviewViewPro
 
         if (this.isBoysenberry) {
             this.appInstanceId = process.env.ROVODEV_SANDBOX_ID as string;
-
-            // Start the local HTTP server so external services can
-            // send prompts to the Rovo Dev chat UI via POST /rovodev/chat.
-            this._localServer = new RovoDevLocalServer(
-                (prompt) => this.invokeRovoDevAskCommand(prompt),
-                () => this._chatProvider.isAgentRunning,
-            );
-            this._localServer.start();
         } else {
             this.appInstanceId = this.extensionApi.metadata.appInstanceId();
         }
@@ -207,7 +200,19 @@ export class RovoDevWebviewProvider extends Disposable implements WebviewViewPro
         this._telemetryProvider = new RovoDevTelemetryProvider(
             this.isBoysenberry ? 'Boysenberry' : 'IDE',
             this.appInstanceId,
+            RovodevStaticConfig.isSandboxVeryLargeRepo,
         );
+
+        if (this.isBoysenberry) {
+            // Start the local HTTP server so external services can
+            // send prompts to the Rovo Dev chat UI via POST /rovodev/chat.
+            this._localServer = new RovoDevLocalServer(
+                (prompt) => this.invokeRovoDevAskCommand(prompt, undefined, true),
+                () => this._chatProvider.isAgentRunning,
+                this._telemetryProvider,
+            );
+            this._localServer.start();
+        }
 
         this._chatProvider = new RovoDevChatProvider(this.isBoysenberry, this._telemetryProvider);
         this._chatProvider.onAgentModelChanged(() => this.refreshAgentModel());
@@ -274,6 +279,7 @@ export class RovoDevWebviewProvider extends Disposable implements WebviewViewPro
 
         this._webView = webviewView.webview;
         this._webviewView = webviewView;
+        webviewView.title = getProductName();
         // grab the webview from the instance field, so it's properly typed
         const webview = this._webView;
 
@@ -585,8 +591,7 @@ export class RovoDevWebviewProvider extends Disposable implements WebviewViewPro
                         });
                         break;
 
-                    case RovoDevViewResponseType.CreateLivePreview:
-                        await this.executeCreateLivePreview();
+                    case RovoDevViewResponseType.CreateLivePreview: {
                         this._telemetryProvider.fireTelemetryEvent({
                             action: 'rovoDevCreateLivePreviewButtonClicked',
                             subject: 'atlascode',
@@ -594,6 +599,12 @@ export class RovoDevWebviewProvider extends Disposable implements WebviewViewPro
                                 promptId: this._chatProvider.currentPromptId,
                             },
                         });
+                        await this.executeCreateLivePreview();
+                        break;
+                    }
+
+                    case RovoDevViewResponseType.ReportAnalyticsEvent:
+                        await this._telemetryProvider.fireTelemetryEvent(e.event);
                         break;
 
                     case RovoDevViewResponseType.AskUserQuestionsSubmit:
@@ -1034,7 +1045,7 @@ export class RovoDevWebviewProvider extends Disposable implements WebviewViewPro
             return;
         }
 
-        const availableModelsData = await this.rovoDevApiClient.getAvailableAgentModels();
+        const availableModelsData = await this.rovoDevApiClient.getAvailableAgentModels(this.isBoysenberry);
         const availableModels = availableModelsData.models ?? [];
         const availableModelsForWebview = availableModels.map((model) => ({
             modelId: model.model_id,
@@ -1250,12 +1261,17 @@ export class RovoDevWebviewProvider extends Disposable implements WebviewViewPro
 
     private async executeCreateLivePreview(): Promise<void> {
         try {
-            // Immediately switch VSCode to preview mode with loading spinner
-            await commands.executeCommand(Commands.BoysenberryShowPreviewPanel);
-            // Call the agent API directly to start a live preview
-            await this.executeApiWithErrorHandling(async (client) => {
-                await client.createLivePreview();
-            }, false);
+            // Immediately switch VSCode to preview mode with loading spinner so the user
+            // gets feedback before the agent's stream catches up.
+            commands.executeCommand(Commands.BoysenberryShowPreviewPanel).then(undefined, (err) => {
+                Logger.error(err, 'Error executing command to show live preview panel');
+            });
+
+            // Drive the live-preview API through the chat provider so the SSE stream
+            // (text/tool-call/tool-return events) is parsed and posted to the webview
+            // exactly like a normal chat response — the chat is also put into "listen"
+            // (GeneratingResponse) mode for the duration of the stream.
+            await this._chatProvider.executeLivePreview();
         } catch (e) {
             await this.processError(e);
         }
@@ -1276,7 +1292,18 @@ export class RovoDevWebviewProvider extends Disposable implements WebviewViewPro
         }
     }
 
-    public async invokeRovoDevAskCommand(prompt: string, context?: RovoDevContextItem[]): Promise<void> {
+    /**
+     * Invokes a RovoDev chat prompt.
+     *
+     * When `fireAndForget` is true, the chat promise is returned directly without being awaited,
+     * allowing the caller to decide whether to await it or not.
+     * When false (default), the chat is awaited before returning.
+     */
+    public async invokeRovoDevAskCommand(
+        prompt: string,
+        context?: RovoDevContextItem[],
+        fireAndForget?: boolean,
+    ): Promise<boolean> {
         // Always focus on the specific vscode view, even if disabled (so user can see the login prompt)
         await this.extensionApi.commands.focusRovodevView();
 
@@ -1289,19 +1316,29 @@ export class RovoDevWebviewProvider extends Disposable implements WebviewViewPro
         });
 
         if (!initialized) {
-            return;
+            return false;
         }
 
         // If disabled, we still want to show the webview but don't execute the chat
         // The webview will show the appropriate login prompt
         if (this.isDisabled) {
-            return;
+            return false;
         }
 
         // Actually invoke the rovodev service, feed responses to the webview as normal
         const revertedChanges = this._revertedChanges;
         this._revertedChanges = [];
-        await this._chatProvider.executeChat({ text: prompt, context: context || [] }, revertedChanges);
+        const chatPromise = this._chatProvider.executeChat({ text: prompt, context: context || [] }, revertedChanges);
+
+        if (fireAndForget) {
+            chatPromise.catch((err) => {
+                Logger.debug(`RovoDevWebviewProvider: error executing chat: ${err}`);
+            });
+            return true;
+        }
+
+        await chatPromise;
+        return true;
     }
 
     /**

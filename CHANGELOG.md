@@ -1,18 +1,87 @@
 ### [Report an Issue](https://github.com/atlassian/atlascode/issues)
 
+## What's new in 4.0.32
+
+### Security
+
+- Fixed arbitrary code execution via `core.fsmonitor` in repository `.git/config`
+
+### Bug Fixes
+
+- **RovoDev (BBY)**: Fixed the response-stream parser so well-formed responses whose `data:` payload contains newlines (e.g. multi-line tool output, code blocks, stack traces) are no longer misclassified as parse errors. The parser now follows the SSE line grammar (multi-line `data:` fields are concatenated) and ignores all comment/keep-alive lines, which removes a large source of false `parse_error` outcomes in the `rovoDevPromptCompleted` telemetry / chat-response SLO. Parser failures are now tagged with distinct error names (`RovoDevChunkShapeError`, `RovoDevJsonParseError`, `RovoDevIncompleteStreamError`) so the remaining genuine cases surface via the event's `errorName` attribute.
+- **RovoDev (BBY)**: The `no_response` outcome of the `rovoDevPromptCompleted` telemetry event is now sub-classified via `errorName` (`no_response_empty_stream` when the stream carried no messages at all, vs `no_response_control_only` when only control/lifecycle events were received and no user-visible part was rendered), so the chat-response SLO can distinguish genuinely-empty backend streams from benign control-only turns.
+
+## What's new in 4.0.31
+
+### Bug Fixes
+
+- **RovoDev**: Fixed markdown formatting in the chat view - headers now render at a consistent 16px, and tables are responsive so they no longer overflow the narrow sidebar.
+- **RovoDev**: Hid stack traces, stderr, and log details from external users while preserving them for Atlassian users.
+- **RovoDev (BBY)**: Fixed `ROVODEV_REBRAND_JCA` env var handling so the "Jira Coding Agent" rebrand works correctly in webviews.
+- **Notifications**: Fixed `atlassianNotificationNotifier` to correctly flush all promise levels, resolving a test reliability issue.
+- **RovoDev**: Fixed the prompt toolbar so only one dropdown (Add, Preferences, or model selector) can be open at a time - opening one now closes any other that was open, instead of stacking a dropdown over a dropdown.
+- **RovoDev (BBY)**: Fixed frequent live preview failures (`HTTP 409` on `/v3/stream_chat`) caused by triggering a live preview while the agent was already streaming. The Live Preview button is now hidden as soon as it is clicked (and while the agent is running), and a backstop guard prevents a live preview request from being sent when a response is already in progress. When a live preview attempt fails or ends without starting a preview, the button is automatically restored so it can be clicked again to retry (the button itself is the retry affordance, so live-preview errors no longer show a non-functional "Try again").
+
+### Improvements
+
+- **RovoDev**: Updated Rovo Dev version to 202607.22.1b1
+- **RovoDev**: Updated Rovo Dev version to 202607.21.1b1
+- **RovoDev**: Updated Rovo Dev version to 202606.10.1b3
+- **Notifications**: Added `siteId` to the `notificationFeedVSCode` GraphQL query so notification feeds are correctly scoped per Atlassian site.
+- **Logger**: Removed a spurious client-side error from Sentry to reduce noise in error reporting.
+- **RovoDev (BBY)**: Added a new `rovoDevPromptCompleted` telemetry event that fires exactly once per user-submitted prompt with a closed-enum `result` (`success`, `error`, `cancelled`, `timeout`, `parse_error`) and optional `errorReason` / `httpStatus` / `messagePartsCount`. The event is only emitted in Boysenberry mode (no consumer in the standard IDE) and is forwarded through the Boysenberry → Jira analytics bridge so a chat-response SLO can be computed as a simple counter ratio without joining on `promptId`. Never emitted for the replay streaming path.
+- **RovoDev (BBY)**: The agent model selector now requests premium models in Boysenberry (via `include_premium=true` on the `/v3/agent-models` API), so premium models appear in the list.
+- **RovoDev (BBY)**: Removed the credit multiplier label from each entry in the agent model selector in Boysenberry only; the label is still shown in the standard IDE.
+
+### Cleanup
+
+- **RovoDev**: Removed unused `canFetchInternalUrl` logic from the container.
+
+## What's new in 4.0.30
+
+### Improvements
+
+- **RovoDev (BBY)**: Rovo Dev telemetry events fired in Boysenberry mode are now also forwarded to the host Jira page via the new VSCode → Jira analytics bridge (`workbench.action.sendAnalyticsEvent`), in addition to the existing telemetry pipeline. Bridge failures are silently swallowed so they cannot interfere with standard telemetry.
+- **RovoDev (BBY)**: Analytics events from the Boysenberry environment are now piped through the webview messaging layer (via `ReportAnalyticsEvent`) rather than being called directly on the extension API, consistent with how live-preview and modified files data are handled.
+- **RovoDev**: Removed the "Documentation" link from the Boysenberry chat meatball dropdown menu.
+
+### Bug Fixes
+
+- **RovoDev**: Fixed `TypeError: terminated` from Node.js undici being incorrectly surfaced as an error dialog when aborting an in-flight chat request. The error is now silently handled as a normal abort, preventing spurious error messages and noisy telemetry — particularly in Boysenberry mode where long-running YOLO streams make mid-stream aborts more common.
+
+- Fixed shell command injection vulnerability (VULN-1825192) in git operations. The `Shell` utility class now uses `shell: false` when spawning processes, and all git commands pass arguments as separate array elements rather than interpolating user-controlled values (e.g. branch names, file paths, commit hashes) directly into shell command strings. This prevents Remote Code Execution via maliciously crafted git branch names.
+
+### Improvements
+
+- **RovoDev**: Added support for Boysenberry-specific product branding. When the `ROVODEV_REBRAND_JCA` environment variable is set to `true` at build time (injected by devai-sandbox), the extension displays "Jira Coding Agent" in place of "Rovo Dev" across all UI surfaces (panel title, commands, messages, etc.).
+
+## What's new in 4.0.29
+
+### Improvements
+
+- **RovoDev**: Updated Rovo Dev version to 202605.14.1
+
 ## What's new in 4.0.28
+
+### Improvements
+
+- **RovoDev (Boysenberry)**: Added feature-gated rebrand of "Rovo Dev" to "Jira Coding Agent" for Boysenberry environments only. Requires both `ROVODEV_REBRAND_JCA=true` (rollout gate) and `ROVODEV_BBY=true` (Boysenberry context). Affects all user-facing strings including headers, error messages, code actions, slash commands, landing page, and login forms.
+
+### Bug Fixes
+
+- **RovoDev (Boysenberry)**: Fixed `[object Object] is not valid json` error in chat when the server sends tool call `args` as a pre-parsed object instead of a JSON string
 
 ### Improvements
 
 - **RovoDev**: Removed the "Create pull request" button from the chat extension — PR creation is now handled via the new Pull Request button in the Session header
 
-- **RovoDev**: Upgraded Rovo Dev to v0.13.63
+- **RovoDev**: Upgraded Rovo Dev to 202604.30.2
 - **RovoDev**: Generalized MCP tool parsing in chat UI to support any MCP toolset via regex matching (`mcp__<name>__invoke_tool` / `mcp__<name>__get_tool_schema`) instead of hardcoded tool names
 
 ### Bug Fixes
 
 - **Webview**: Fixed `ChunkLoadError` for CSS chunks (e.g. `atlascodeRovoDev`, `compiled-css`) when running with a Firefox-based webview engine (e.g. code-server). Switched from `MiniCssExtractPlugin` to `style-loader` in the React webpack bundles so CSS is injected as `<style>` tags instead of being dynamically fetched as separate files, which Firefox cannot do for `vscode-resource` URLs.
-
+- **RovoDev**: Fixed rate limit exceeded message showing a literal `{title}` placeholder instead of the actual credit type title
 
 ## What's new in 4.0.27
 
@@ -50,7 +119,6 @@
 ### Features
 
 - **RovoDev**: Added copy code button within the Rovo Dev chat for code blocks in the chat.
-
 
 ## What's new in 4.0.23
 
