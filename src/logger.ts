@@ -172,10 +172,18 @@ export class Logger {
             appInstanceId: metadata.appInstanceId,
             sessionId: metadata.sessionId,
             promptId: promptId,
+            ...(metadata.veryLargeRepo ? { veryLargeRepo: metadata.veryLargeRepo } : {}),
         };
+        const sentryExtraTags: Record<string, string> = {
+            ...metadata,
+            veryLargeRepo: metadata.veryLargeRepo ? 'true' : '',
+        };
+        if (!metadata.veryLargeRepo) {
+            delete sentryExtraTags.veryLargeRepo;
+        }
 
         this.Instance.errorInternal('RovoDev', ex, capturedBy, errorMessage, rovoDevParams, ...params);
-        this.Instance.logSentry('RovoDev', ex, capturedBy, errorMessage, metadata, { promptId, params });
+        this.Instance.logSentry('RovoDev', ex, capturedBy, errorMessage, sentryExtraTags, { promptId, params });
     }
 
     /** DO NOT CALL this function directly. It's meant to be called only by `BitbucketLogger`. */
@@ -213,6 +221,32 @@ export class Logger {
         }
     }
 
+    /**
+     * Returns true if the error is a known, expected HTTP error that should not be sent to Sentry.
+     * These are client-side HTTP errors (401, 403, 404, 429) that are expected to occur during
+     * normal operation (e.g. expired credentials, rate limiting, missing resources) and generate
+     * high event volume with no actionable signal.
+     */
+    private isExpectedHttpError(ex: Error): boolean {
+        const status = (ex as any)?.response?.status ?? (ex as any)?.status;
+        const FILTERED_HTTP_STATUS_CODES = [401, 403, 404, 429];
+        if (status && FILTERED_HTTP_STATUS_CODES.includes(status)) {
+            return true;
+        }
+        // Also catch errors where the status is embedded in the message (e.g. GraphQL errors)
+        const message = ex?.message?.toLowerCase() ?? '';
+        return (
+            message.includes("'unauthorized'") ||
+            message.includes("'forbidden'") ||
+            message.includes("'not found'") ||
+            message.includes("'too many requests'") ||
+            message.includes('status code 401') ||
+            message.includes('status code 403') ||
+            message.includes('status code 404') ||
+            message.includes('status code 429')
+        );
+    }
+
     private logSentry(
         productArea: ErrorProductArea,
         ex: Error,
@@ -221,6 +255,11 @@ export class Logger {
         extraTags: Record<string, string> = {},
         extraExtra: Record<string, any> = {},
     ) {
+        if (this.isExpectedHttpError(ex)) {
+            Logger.debug('Skipping Sentry capture for expected HTTP error', ex?.message);
+            return;
+        }
+
         if (SentryService.getInstance().isInitialized()) {
             try {
                 SentryService.getInstance().captureException(ex, {

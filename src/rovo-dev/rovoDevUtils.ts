@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import yaml from 'js-yaml';
 import path from 'path';
+import { getProductName } from 'src/rovo-dev/api/rovodevStaticConfig';
 import { window, workspace } from 'vscode';
 
 import {
@@ -13,12 +14,12 @@ import {
 
 export type SupportedConfigFiles = 'config.yml' | 'mcp.json' | '.agent.md' | 'rovodev.log';
 
-const FriendlyName: Record<SupportedConfigFiles, string> = {
-    'config.yml': 'Rovo Dev settings file',
-    'mcp.json': 'Rovo Dev MCP configuration',
-    '.agent.md': 'Rovo Dev Global Memory file',
-    'rovodev.log': 'Rovo Dev log file',
-};
+const getFriendlyName = (): Record<SupportedConfigFiles, string> => ({
+    'config.yml': `${getProductName()} settings file`,
+    'mcp.json': `${getProductName()} MCP configuration`,
+    '.agent.md': `${getProductName()} Global Memory file`,
+    'rovodev.log': `${getProductName()} log file`,
+});
 
 // Read logging.path from ~/.rovodev/config.yml if present.
 function getLogPathFromConfig(home: string): string | undefined {
@@ -66,7 +67,7 @@ export async function openRovoDevConfigFile(configFile: SupportedConfigFiles) {
         const doc = await workspace.openTextDocument(filePath);
         await window.showTextDocument(doc);
     } catch (err) {
-        window.showErrorMessage(`Could not open ${FriendlyName[configFile]} (${filePath}): ${err}`);
+        window.showErrorMessage(`Could not open ${getFriendlyName()[configFile]} (${filePath}): ${err}`);
     }
 }
 
@@ -105,7 +106,7 @@ export function statusJsonResponseToMarkdown(response: RovoDevStatusResponse): s
     const data = response.data;
 
     let buffer = '';
-    buffer += '**Rovo Dev**\n';
+    buffer += `**${getProductName()}**\n`;
     buffer += `- Session ID: ${data.cliVersion.sessionId}\n`;
     buffer += `- Version: ${data.cliVersion.version}\n`;
     buffer += '\n';
@@ -162,13 +163,22 @@ export function usageJsonResponseToMarkdown(response: RovoDevUsageResponse): {
         }
     } else {
         // If credit_total returns -1, it means unlimited credits
+        // If credit_total is 0 or missing, omit Remaining and Total lines
+        const hasValidTotal =
+            data.credit_total !== undefined &&
+            data.credit_total !== null &&
+            data.credit_total !== 0 &&
+            !Number.isNaN(data.credit_total);
+
         const remaining = data.credit_total === -1 ? 'Unlimited' : numberFormatter.format(data.credit_remaining);
         const total = data.credit_total === -1 ? 'Unlimited' : numberFormatter.format(data.credit_total);
 
         buffer += `**${data.title}**\n`;
         buffer += `- Used: ${numberFormatter.format(data.credit_used)}\n`;
-        buffer += `- Remaining: ${remaining}\n`;
-        buffer += `- Total: ${total}\n`;
+        if (hasValidTotal) {
+            buffer += `- Remaining: ${remaining}\n`;
+            buffer += `- Total: ${total}\n`;
+        }
         buffer += '\n';
     }
 

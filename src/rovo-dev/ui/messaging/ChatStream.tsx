@@ -49,6 +49,8 @@ interface ChatStreamProps {
     credentialHints?: CredentialHint[];
     onGeneratePlanClick?: (planId: string, proceed: boolean) => void;
     showLivePreviewButton?: boolean;
+    onCreateLivePreview?: () => boolean;
+    isAtlassianUser?: boolean;
 }
 
 export const ChatStream: React.FC<ChatStreamProps> = ({
@@ -74,6 +76,8 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
     credentialHints,
     onGeneratePlanClick,
     showLivePreviewButton,
+    onCreateLivePreview,
+    isAtlassianUser,
 }) => {
     const chatEndRef = React.useRef<HTMLDivElement>(null);
     const sentinelRef = React.useRef<HTMLDivElement>(null);
@@ -231,6 +235,7 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
                     onLinkClick={onLinkClick}
                     deepPlanCreated={deepPlanCreated}
                     onGeneratePlanClick={onGeneratePlanClick}
+                    isAtlassianUser={isAtlassianUser}
                 />
             )}
 
@@ -254,6 +259,7 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
                             onRestartProcess={renderProps.onRestartProcess}
                             onToolPermissionChoice={onToolPermissionChoice}
                             onLinkClick={onLinkClick}
+                            isAtlassianUser={isAtlassianUser}
                         />
                     ))}
                     {modalDialogs.length > 1 && modalDialogs.every((d) => d.type === 'toolPermissionRequest') && (
@@ -279,7 +285,7 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
 
             {showActionFooter && (
                 <FollowUpActionFooter>
-                    <LivePreviewButton messagingApi={messagingApi} />
+                    <LivePreviewButton messagingApi={messagingApi} onCreateLivePreview={onCreateLivePreview} />
                 </FollowUpActionFooter>
             )}
             <div id="sentinel" ref={sentinelRef} style={{ height: '10px', width: '100%', pointerEvents: 'none' }} />

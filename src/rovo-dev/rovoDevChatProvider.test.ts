@@ -1,5 +1,6 @@
 import { v4 } from 'uuid';
 
+import { getProductName } from './api/rovodevStaticConfig';
 import { RovoDevApiClient } from './client/rovoDevApiClient';
 import { RovoDevChatProvider } from './rovoDevChatProvider';
 import { RovoDevTelemetryProvider } from './rovoDevTelemetryProvider';
@@ -62,6 +63,7 @@ describe('RovoDevChatProvider', () => {
         // Mock API client
         mockApiClient = {
             chat: jest.fn(),
+            createLivePreview: jest.fn(),
             cancel: jest.fn(),
             replay: jest.fn(),
             resumeToolCall: jest.fn(),
@@ -294,13 +296,116 @@ describe('RovoDevChatProvider', () => {
         });
     });
 
+    describe('executeLivePreview', () => {
+        it('should throw error if API client is not initialized', async () => {
+            const providerWithoutClient = new RovoDevChatProvider(false, mockTelemetryProvider);
+            providerWithoutClient.setWebview(mockWebview);
+
+            await expect(providerWithoutClient.executeLivePreview()).rejects.toThrow(/failed to initialize/);
+            expect(mockApiClient.createLivePreview).not.toHaveBeenCalled();
+        });
+
+        it('should call createLivePreview when the agent is idle', async () => {
+            await chatProvider.setReady(mockApiClient);
+
+            const mockReadableStream = new ReadableStream({
+                start(controller) {
+                    controller.enqueue(new TextEncoder().encode('data: {"event_kind": "close"}\n\n'));
+                    controller.close();
+                },
+            });
+            mockApiClient.createLivePreview.mockResolvedValue({ body: mockReadableStream } as Response);
+
+            await chatProvider.executeLivePreview();
+
+            expect(mockApiClient.createLivePreview).toHaveBeenCalledTimes(1);
+        });
+
+        it('should NOT call createLivePreview when the agent is already running (avoids HTTP 409)', async () => {
+            await chatProvider.setReady(mockApiClient);
+
+            // Simulate an in-flight stream by marking the agent as running.
+            (chatProvider as any)._abortController = new AbortController();
+            expect(chatProvider.isAgentRunning).toBe(true);
+
+            await chatProvider.executeLivePreview();
+
+            // The guard must short-circuit before hitting the backend so the
+            // second concurrent stream is never requested.
+            expect(mockApiClient.createLivePreview).not.toHaveBeenCalled();
+
+            // The button (hidden optimistically on click) should be restored so it
+            // reappears once the in-flight response finishes and the user can retry.
+            expect(mockWebview.postMessage).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    type: RovoDevProviderMessageType.ShowLivePreviewButton,
+                    show: true,
+                }),
+            );
+        });
+
+        it('should restore the button when the attempt ends without starting a preview', async () => {
+            await chatProvider.setReady(mockApiClient);
+
+            // A stream that finishes cleanly but never emits a `configure_live_preview`
+            // tool-call — i.e. the preview did not actually start.
+            const mockReadableStream = new ReadableStream({
+                start(controller) {
+                    controller.enqueue(new TextEncoder().encode('data: {"event_kind": "close"}\n\n'));
+                    controller.close();
+                },
+            });
+            mockApiClient.createLivePreview.mockResolvedValue({ body: mockReadableStream } as Response);
+
+            await chatProvider.executeLivePreview();
+
+            expect(mockWebview.postMessage).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    type: RovoDevProviderMessageType.ShowLivePreviewButton,
+                    show: true,
+                }),
+            );
+        });
+
+        it('should NOT restore the button when the preview actually starts', async () => {
+            await chatProvider.setReady(mockApiClient);
+
+            // A stream that emits a `configure_live_preview` tool-call — the preview
+            // started successfully, so the button must stay hidden.
+            const toolCallData = JSON.stringify({
+                tool_name: 'configure_live_preview',
+                tool_call_id: 'tc-1',
+                args: '{}',
+            });
+            const mockReadableStream = new ReadableStream({
+                start(controller) {
+                    controller.enqueue(new TextEncoder().encode(`event: tool-call\ndata: ${toolCallData}\n\n`));
+                    controller.enqueue(new TextEncoder().encode('event: close\ndata: {}\n\n'));
+                    controller.close();
+                },
+            });
+            mockApiClient.createLivePreview.mockResolvedValue({ body: mockReadableStream } as Response);
+
+            await chatProvider.executeLivePreview();
+
+            // The tool-call handler hides the button (show:false); the completion
+            // path must NOT subsequently re-show it (show:true).
+            expect(mockWebview.postMessage).not.toHaveBeenCalledWith(
+                expect.objectContaining({
+                    type: RovoDevProviderMessageType.ShowLivePreviewButton,
+                    show: true,
+                }),
+            );
+        });
+    });
+
     describe('executeReplay', () => {
         it('should throw error if API client is not initialized', async () => {
             const providerWithoutClient = new RovoDevChatProvider(false, mockTelemetryProvider);
             providerWithoutClient.setWebview(mockWebview);
 
             await expect(providerWithoutClient.executeReplay()).rejects.toThrow(
-                'Unable to replay the previous conversation. Rovo Dev failed to initialize',
+                `Unable to replay the previous conversation. ${getProductName()} failed to initialize`,
             );
         });
 
@@ -462,6 +567,19 @@ describe('RovoDevChatProvider', () => {
             await chatProvider.executeCancel(false);
 
             expect(chatProvider['_lastMessageSentTime']).toBeUndefined();
+        });
+
+        it('should clear pending deferred request on cancellation so next prompt is sent as plain message', async () => {
+            await chatProvider.setReady(mockApiClient);
+
+            // Simulate a pending deferred tool call (e.g. ask_user_questions)
+            chatProvider['_pendingDeferredRequest'] = 'deferred-tool-call-123';
+
+            mockApiClient.cancel.mockResolvedValue({ cancelled: true, message: 'Cancelled' });
+
+            await chatProvider.executeCancel(false);
+
+            expect(chatProvider['_pendingDeferredRequest']).toBeUndefined();
         });
     });
 
@@ -1042,6 +1160,293 @@ describe('RovoDevChatProvider', () => {
                     }),
                 }),
             );
+        });
+
+        it('should handle undici TypeError: terminated as an abort (no error dialog)', async () => {
+            // Simulates the Node.js undici error thrown when AbortController.abort() is called
+            // on an in-flight fetch. undici throws a plain TypeError with message "terminated"
+            // rather than an AbortError, so it must be caught explicitly.
+            const terminatedError = new TypeError('terminated');
+            mockApiClient.chat.mockRejectedValue(terminatedError);
+
+            const mockPrompt: RovoDevPrompt = {
+                text: 'test prompt',
+                context: [],
+            };
+
+            await chatProvider.executeChat(mockPrompt, []);
+
+            // Should NOT show an error dialog — terminated is a normal abort side-effect
+            expect(mockWebview.postMessage).not.toHaveBeenCalledWith(
+                expect.objectContaining({
+                    type: RovoDevProviderMessageType.ShowDialog,
+                }),
+            );
+
+            // Should send CompleteMessage so the UI returns to an interactive state
+            expect(mockWebview.postMessage).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    type: RovoDevProviderMessageType.CompleteMessage,
+                }),
+            );
+        });
+
+        it('should still show error dialog for other TypeErrors (not terminated)', async () => {
+            // Ensures the fix is narrowly scoped and doesn't swallow real TypeErrors
+            const otherTypeError = new TypeError('Failed to fetch');
+            mockApiClient.chat.mockRejectedValue(otherTypeError);
+
+            const mockPrompt: RovoDevPrompt = {
+                text: 'test prompt',
+                context: [],
+            };
+
+            await chatProvider.executeChat(mockPrompt, []);
+
+            expect(mockWebview.postMessage).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    type: RovoDevProviderMessageType.ShowDialog,
+                }),
+            );
+        });
+    });
+
+    // The rovoDevPromptCompleted event is the terminal SLO signal forwarded
+    // through the Boysenberry → Jira analytics bridge. The bridge relies on
+    // three strict invariants that these tests pin down:
+    //   1) Only emitted in Boysenberry mode (no consumer in the standard IDE).
+    //   2) Exactly-once per promptId — the first terminal classification wins.
+    //   3) Never emitted for the replay streaming path.
+    // We exercise the helper directly here (via bracket access) so the tests
+    // focus on those invariants without the heavy executeChat scaffolding.
+    describe('rovoDevPromptCompleted (SLO)', () => {
+        beforeEach(() => {
+            // Re-create the provider with isBoysenberry=true so the helper
+            // does not early-return. The "non-boysenberry suppression" test
+            // below covers the false case explicitly.
+            chatProvider = new RovoDevChatProvider(true, mockTelemetryProvider);
+            chatProvider.setWebview(mockWebview);
+            // Place the provider in a state equivalent to "an in-flight prompt
+            // is being processed" so firePromptCompleted has a promptId to use.
+            chatProvider['_currentPromptId'] = 'prompt-A';
+            mockTelemetryProvider.fireTelemetryEvent.mockClear();
+        });
+
+        it('does not emit when not running in Boysenberry mode (standard IDE)', () => {
+            const ideProvider = new RovoDevChatProvider(false, mockTelemetryProvider);
+            ideProvider.setWebview(mockWebview);
+            ideProvider['_currentPromptId'] = 'prompt-ide';
+
+            ideProvider['firePromptCompleted']('success', { messagePartsCount: 1 });
+            ideProvider['firePromptCompleted']('error', { errorReason: 'stream_exception' });
+
+            expect(mockTelemetryProvider.fireTelemetryEvent).not.toHaveBeenCalled();
+        });
+
+        it('emits rovoDevPromptCompleted with result=success and messagePartsCount', () => {
+            chatProvider['firePromptCompleted']('success', { messagePartsCount: 3 });
+
+            expect(mockTelemetryProvider.fireTelemetryEvent).toHaveBeenCalledTimes(1);
+            expect(mockTelemetryProvider.fireTelemetryEvent).toHaveBeenCalledWith({
+                action: 'rovoDevPromptCompleted',
+                subject: 'atlascode',
+                attributes: {
+                    promptId: 'prompt-A',
+                    result: 'success',
+                    messagePartsCount: 3,
+                },
+            });
+        });
+
+        it('emits rovoDevPromptCompleted with errorReason and httpStatus when provided', () => {
+            chatProvider['firePromptCompleted']('error', {
+                errorReason: 'http_5xx',
+                httpStatus: 503,
+            });
+
+            expect(mockTelemetryProvider.fireTelemetryEvent).toHaveBeenCalledTimes(1);
+            expect(mockTelemetryProvider.fireTelemetryEvent).toHaveBeenCalledWith({
+                action: 'rovoDevPromptCompleted',
+                subject: 'atlascode',
+                attributes: {
+                    promptId: 'prompt-A',
+                    result: 'error',
+                    errorReason: 'http_5xx',
+                    httpStatus: 503,
+                },
+            });
+        });
+
+        it('emits rovoDevPromptCompleted with errorName when provided (diagnostic breakdown)', () => {
+            chatProvider['firePromptCompleted']('error', {
+                errorReason: 'stream_exception',
+                errorName: 'UserError',
+            });
+
+            expect(mockTelemetryProvider.fireTelemetryEvent).toHaveBeenCalledTimes(1);
+            expect(mockTelemetryProvider.fireTelemetryEvent).toHaveBeenCalledWith({
+                action: 'rovoDevPromptCompleted',
+                subject: 'atlascode',
+                attributes: {
+                    promptId: 'prompt-A',
+                    result: 'error',
+                    errorReason: 'stream_exception',
+                    errorName: 'UserError',
+                },
+            });
+        });
+
+        // The terminal `no_response` classification is sub-typed via `errorName`
+        // so the SLO can separate genuinely-empty backend streams from turns
+        // that only emitted control/lifecycle events (and thus legitimately
+        // rendered nothing user-visible). We drive processResponse end-to-end
+        // because the discriminator (isFirstMessage) lives inside that loop.
+        describe('no_response sub-classification', () => {
+            const findPromptCompletedCall = () =>
+                mockTelemetryProvider.fireTelemetryEvent.mock.calls
+                    .map((c: any[]) => c[0])
+                    .find((e: any) => e.action === 'rovoDevPromptCompleted');
+
+            it('classifies a completely empty stream as no_response_empty_stream', async () => {
+                await chatProvider.setReady(mockApiClient);
+                chatProvider['_currentPromptId'] = 'prompt-empty';
+                mockTelemetryProvider.fireTelemetryEvent.mockClear();
+
+                const emptyStream = new ReadableStream({
+                    start(controller) {
+                        controller.close();
+                    },
+                });
+                const response = { body: emptyStream } as Response;
+
+                await chatProvider['processResponse']('chat', response);
+
+                const event = findPromptCompletedCall();
+                expect(event).toBeDefined();
+                expect(event.attributes.result).toBe('error');
+                expect(event.attributes.errorReason).toBe('no_response');
+                expect(event.attributes.errorName).toBe('no_response_empty_stream');
+                expect(event.attributes.messagePartsCount).toBe(0);
+            });
+
+            it('classifies a control-only stream (no user-visible parts) as no_response_control_only', async () => {
+                await chatProvider.setReady(mockApiClient);
+                chatProvider['_currentPromptId'] = 'prompt-control';
+                mockTelemetryProvider.fireTelemetryEvent.mockClear();
+
+                // A `thinking` event is a control/lifecycle message: it is parsed
+                // (so isFirstMessage flips) but is not a user-visible part.
+                const controlOnlyStream = new ReadableStream({
+                    start(controller) {
+                        controller.enqueue(
+                            new TextEncoder().encode('event: thinking\ndata: {"content": "pondering"}\n\n'),
+                        );
+                        controller.close();
+                    },
+                });
+                const response = { body: controlOnlyStream } as Response;
+
+                await chatProvider['processResponse']('chat', response);
+
+                const event = findPromptCompletedCall();
+                expect(event).toBeDefined();
+                expect(event.attributes.result).toBe('error');
+                expect(event.attributes.errorReason).toBe('no_response');
+                expect(event.attributes.errorName).toBe('no_response_control_only');
+                expect(event.attributes.messagePartsCount).toBe(0);
+            });
+        });
+
+        it('omits optional attributes when not provided (bridge expects closed shape)', () => {
+            chatProvider['firePromptCompleted']('cancelled', { errorReason: 'aborted' });
+
+            const call = mockTelemetryProvider.fireTelemetryEvent.mock.calls[0][0];
+            expect(call.attributes).not.toHaveProperty('httpStatus');
+            expect(call.attributes).not.toHaveProperty('messagePartsCount');
+            expect(call.attributes).toEqual({
+                promptId: 'prompt-A',
+                result: 'cancelled',
+                errorReason: 'aborted',
+            });
+        });
+
+        it('is exactly-once per promptId — subsequent calls for the same prompt are dropped', () => {
+            chatProvider['firePromptCompleted']('error', { errorReason: 'stream_exception' });
+            chatProvider['firePromptCompleted']('success', { messagePartsCount: 2 });
+            chatProvider['firePromptCompleted']('cancelled', { errorReason: 'aborted' });
+
+            expect(mockTelemetryProvider.fireTelemetryEvent).toHaveBeenCalledTimes(1);
+            // Cast to any: the TelemetryEvent union narrows `attributes` per-event,
+            // and the test only cares about the dedupe behaviour for the call we made.
+            const firstCallAttributes = (mockTelemetryProvider.fireTelemetryEvent.mock.calls[0][0] as any).attributes;
+            expect(firstCallAttributes.result).toBe('error');
+        });
+
+        it('emits independently for distinct promptIds', () => {
+            chatProvider['firePromptCompleted']('success', { messagePartsCount: 1 });
+
+            chatProvider['_currentPromptId'] = 'prompt-B';
+            chatProvider['firePromptCompleted']('error', { errorReason: 'no_response' });
+
+            expect(mockTelemetryProvider.fireTelemetryEvent).toHaveBeenCalledTimes(2);
+            const promptIds = mockTelemetryProvider.fireTelemetryEvent.mock.calls.map(
+                (c: any[]) => (c[0] as any).attributes.promptId,
+            );
+            expect(promptIds).toEqual(['prompt-A', 'prompt-B']);
+        });
+
+        it('does nothing when there is no current promptId', () => {
+            chatProvider['_currentPromptId'] = '';
+
+            chatProvider['firePromptCompleted']('success', { messagePartsCount: 1 });
+
+            expect(mockTelemetryProvider.fireTelemetryEvent).not.toHaveBeenCalled();
+        });
+
+        it('bounds the dedupe Set to avoid unbounded memory growth', () => {
+            // Fill the set just past the cap to confirm eviction kicks in.
+            const cap = (RovoDevChatProvider as any)._completedPromptIdsCap as number;
+            for (let i = 0; i < cap + 5; i++) {
+                chatProvider['_currentPromptId'] = `prompt-${i}`;
+                chatProvider['firePromptCompleted']('success', { messagePartsCount: 1 });
+            }
+
+            const dedupe: Set<string> = chatProvider['_completedPromptIds'];
+            expect(dedupe.size).toBeLessThanOrEqual(cap);
+            // The oldest entries must have been evicted.
+            expect(dedupe.has('prompt-0')).toBe(false);
+            // The most recent entry must still be present.
+            expect(dedupe.has(`prompt-${cap + 4}`)).toBe(true);
+        });
+
+        describe('classifyStreamingError', () => {
+            // The classifier produces the errorReason + httpStatus attributes
+            // attached to rovoDevPromptCompleted for fetch/HTTP failures. The
+            // SLO downstream slices on these closed-enum values, so the
+            // boundaries here are part of the bridge contract.
+            it('classifies RovoDevApiError 5xx as http_5xx with the status code and error name', async () => {
+                const { RovoDevApiError } = await import('./client/rovoDevApiClient');
+                const err = new RovoDevApiError('boom', 502, undefined);
+                const result = chatProvider['classifyStreamingError'](err);
+                expect(result).toEqual({ errorReason: 'http_5xx', errorName: err.name, httpStatus: 502 });
+            });
+
+            it('classifies RovoDevApiError 4xx as http_4xx with the status code and error name', async () => {
+                const { RovoDevApiError } = await import('./client/rovoDevApiClient');
+                const err = new RovoDevApiError('bad request', 422, undefined);
+                const result = chatProvider['classifyStreamingError'](err);
+                expect(result).toEqual({ errorReason: 'http_4xx', errorName: err.name, httpStatus: 422 });
+            });
+
+            it('falls back to network_error for non-API errors and captures the error name', () => {
+                const result = chatProvider['classifyStreamingError'](new TypeError('socket hang up'));
+                expect(result).toEqual({ errorReason: 'network_error', errorName: 'TypeError' });
+            });
+
+            it('omits errorName for non-Error thrown values', () => {
+                const result = chatProvider['classifyStreamingError']('a string error');
+                expect(result).toEqual({ errorReason: 'network_error' });
+            });
         });
     });
 });
